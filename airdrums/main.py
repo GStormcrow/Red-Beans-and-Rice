@@ -42,6 +42,7 @@ from .tracking.depth import DepthEngine
 from .tracking.detectors import HitResult, LineCrossDetector
 from .tracking.hands import HandSkeleton, Joint
 from .ui.overlay import Overlay
+from .ui.welcome import launch_welcome
 
 log = logging.getLogger("airdrums.main")
 
@@ -545,20 +546,44 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    """Entry point — configure logging, parse args, run app."""
+# def main(argv: Optional[List[str]] = None) -> int:
+#     """Entry point — configure logging, parse args, run app."""
+#     logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
+#     args = build_parser().parse_args(argv)
+#     try:
+#         app = AirDrumsApp(args)
+#         app.run()
+#     except KeyboardInterrupt:
+#         log.info("Interrupted by user")
+#     except Exception as exc:
+#         log.exception("Fatal error: %s", exc)
+#         return 1
+#     return 0
+def main(argv: Optional[list] = None) -> int:
     logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
     args = build_parser().parse_args(argv)
-    try:
-        app = AirDrumsApp(args)
-        app.run()
-    except KeyboardInterrupt:
-        log.info("Interrupted by user")
-    except Exception as exc:
-        log.exception("Fatal error: %s", exc)
-        return 1
-    return 0
 
+    # Show welcome screen first; on_start is called when user clicks Start.
+    # launch_welcome blocks until the window is closed.
+    # on_start receives the fully-built AirDrumsApp from the loading screen
+    def on_start(app, settings: dict) -> None:
+        if app is None:
+            log.error("Initialisation failed; cannot start.")
+            return
+        try:
+            app.run()
+        except KeyboardInterrupt:
+            log.info("Interrupted by user")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Fatal: %s", exc)
+        finally:
+            try:
+                app.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+
+    launch_welcome(on_start=on_start, initial={}, args=args)
+    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

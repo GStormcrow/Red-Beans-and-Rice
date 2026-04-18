@@ -29,8 +29,8 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # Camera
 # ---------------------------------------------------------------------------
 CAMERA_INDEX = 0
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 720
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 
 # ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ AUTOSAVE_INTERVAL_S = 60
 LOOP_BAR_OPTIONS = (1, 2, 4, 8)
 PLAYBACK_SPEED_MIN = 0.5
 PLAYBACK_SPEED_MAX = 2.0
-KEYFRAME_FPS = 10
+KEYFRAME_FPS = 20
 
 # ---------------------------------------------------------------------------
 # Analytics
