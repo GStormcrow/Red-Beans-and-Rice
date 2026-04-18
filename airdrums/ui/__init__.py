@@ -1,4 +1,5 @@
 """UI subsystem: OpenCV overlay + PyQt5 settings panel."""
-from .overlay import Overlay
+from airdrums.ui.overlay import Overlay
+from airdrums.ui.settings import launch_settings_panel
 
-__all__ = ["Overlay"]
+__all__ = ["Overlay", "launch_settings_panel"]

@@ -1,19 +1,25 @@
 """
 airdrums.analytics.stats
 ========================
-Live + post-session analytics.
+Live and post-session analytics for AirDrums V2.
 
-Live:
-  * BPM via inter-hit interval rolling median (8 hits).
-  * BPM stability (stdev per bar), drift indicator (speeding up / dragging).
+Live analytics
+--------------
+* BPM via rolling median of inter-hit intervals on snare hits.
+* BPM stability as rolling standard deviation over the last
+  ``BPM_STABILITY_BARS`` bars.
+* Drift indicator: ``"rushing"`` / ``"dragging"`` / ``"steady"`` derived from
+  the linear trend of recent inter-hit intervals.
 
-Post-session:
-  * Per-drum hit heatmap (2D density of tip positions) as PNG.
-  * Velocity histogram per drum as PNG.
-  * Timing accuracy vs nearest grid position (ms offset).
-  * Hand balance (left/right count + velocity ratio + limb-independence score).
-  * Session summary (hits, HPM, duration, most/least used drum).
-  * Combined PDF session report via reportlab.
+Post-session analytics
+----------------------
+* Per-drum hit heatmap — 2D scatter of approximate x positions, grouped by
+  drum name and mapped to DrumLine.x_center.
+* Velocity histogram per drum — count of events per velocity_band.
+* Timing accuracy — per-hit offset from the nearest BPM grid position.
+* Hand balance — left vs right hit count and per-hand average velocity.
+* Session summary — total hits, duration, hits per minute, most/least used.
+* PDF report via reportlab with all charts.
 """
 from __future__ import annotations
 
@@ -23,282 +29,560 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
-from .. import config
+from airdrums import config
+from airdrums.config import DrumLine
+from airdrums.recording.session import HitEvent
 
 log = logging.getLogger(__name__)
 
 
 class SessionAnalytics:
-    """Computes live + post-session analytics over a :class:`Session`."""
+    """Computes live and post-session analytics.
 
-    KICK_SNARE_NOTES = {36, 38, 37}    # used for live BPM inference
+    Parameters
+    ----------
+    drum_lines:
+        The kit layout, used to map drum names to approximate x positions for
+        heatmap generation and for grouping in charts.
+    """
 
-    def __init__(self, session):
-        self.session = session
-        self._ibi_window: Deque[float] = deque(maxlen=config.BPM_ROLLING_WINDOW)
-        self._last_kick_snare_ms: Optional[float] = None
-        self._bpm_history: List[float] = []
+    def __init__(self, drum_lines: List[DrumLine]) -> None:
+        """Initialise the analytics engine."""
+        self.drum_lines: List[DrumLine] = drum_lines
+
+        # Map drum name -> x_center for heatmap fallback
+        self._x_center_map: Dict[str, float] = {
+            dl.name: dl.x_center for dl in drum_lines
+        }
+
+        # Live BPM — rolling window of inter-hit BPM estimates from snare
+        self._snare_ibi_window: Deque[float] = deque(
+            maxlen=config.BPM_SMOOTHING_WINDOW
+        )
+        self._last_snare_ms: Optional[float] = None
+
+        # BPM stability — accumulate estimates per bar
         self._bpm_per_bar: List[List[float]] = [[]]
-        self._strike_positions: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
+
+        # Linear-trend drift — recent inter-hit intervals in ms
+        self._recent_ihi_ms: Deque[float] = deque(maxlen=16)
+        self._last_hit_ms: Optional[float] = None
 
     # ------------------------------------------------------------------
-    # Live
+    # Live — call on every hit event
     # ------------------------------------------------------------------
-    def on_hit(self, event, tip_xy: Optional[Tuple[float, float]] = None) -> None:
-        """Call this immediately after each HitEvent is recorded."""
-        if tip_xy is not None:
-            self._strike_positions[event.drum_name].append(tip_xy)
-        if event.midi_note in self.KICK_SNARE_NOTES:
-            if self._last_kick_snare_ms is not None:
-                dt_ms = event.timestamp_ms - self._last_kick_snare_ms
+
+    def on_hit(self, event: HitEvent) -> None:
+        """Update live analytics on each new HitEvent.
+
+        Should be called immediately after the event is recorded.  Updates
+        the BPM estimate, stability window, and drift indicator.
+
+        Parameters
+        ----------
+        event:
+            The newly recorded drum hit.
+        """
+        # Drift: track inter-hit intervals regardless of drum
+        if self._last_hit_ms is not None:
+            dt = event.timestamp_ms - self._last_hit_ms
+            if 20 <= dt <= 5000:
+                self._recent_ihi_ms.append(dt)
+        self._last_hit_ms = event.timestamp_ms
+
+        # BPM from snare hits only
+        if event.drum_name == "snare":
+            if self._last_snare_ms is not None:
+                dt_ms = event.timestamp_ms - self._last_snare_ms
                 if 80 <= dt_ms <= 2000:
                     bpm = 60000.0 / dt_ms
-                    # Assume downbeats every 1-2 hits
-                    bpm = min(bpm * 2, 240) if bpm < 60 else bpm
-                    self._ibi_window.append(bpm)
+                    # A single snare hit per beat implies the interval is one
+                    # beat; double if too slow (half-time feel heuristic).
+                    if bpm < 60:
+                        bpm = min(bpm * 2, 240)
+                    self._snare_ibi_window.append(bpm)
                     self._bpm_per_bar[-1].append(bpm)
-            self._last_kick_snare_ms = event.timestamp_ms
+            self._last_snare_ms = event.timestamp_ms
+
+    def tick_bar(self) -> None:
+        """Advance the per-bar BPM accumulator.
+
+        Call this on each detected downbeat.  The stability window retains
+        only the last :data:`~airdrums.config.BPM_STABILITY_BARS` bars.
+        """
+        self._bpm_per_bar.append([])
+        # Trim to BPM_STABILITY_BARS + 1 (current bar being filled)
+        if len(self._bpm_per_bar) > config.BPM_STABILITY_BARS + 1:
+            self._bpm_per_bar.pop(0)
+
+    # ------------------------------------------------------------------
+    # Live properties
+    # ------------------------------------------------------------------
 
     @property
     def bpm(self) -> float:
-        if not self._ibi_window:
-            return config.MIDI_DEFAULT_BPM
-        return float(statistics.median(self._ibi_window))
+        """Current BPM estimate as a rolling median over snare inter-hit intervals.
+
+        Returns 120.0 if no snare hits have been recorded yet.
+        """
+        if not self._snare_ibi_window:
+            return 120.0
+        return float(statistics.median(self._snare_ibi_window))
 
     @property
     def bpm_stability(self) -> float:
-        """Standard deviation of BPM within the current bar (lower = tighter)."""
-        cur = self._bpm_per_bar[-1]
-        if len(cur) < 2:
+        """Rolling std dev of BPM estimates over the last stability window.
+
+        A lower value indicates tighter tempo.  Returns 0.0 when there is
+        insufficient data.
+        """
+        # Flatten all bars in the stability window (excluding current)
+        all_vals: List[float] = []
+        for bar in self._bpm_per_bar[:-1]:
+            all_vals.extend(bar)
+        # Include current bar too for a richer estimate
+        all_vals.extend(self._bpm_per_bar[-1])
+
+        if len(all_vals) < 2:
             return 0.0
-        return float(statistics.pstdev(cur))
+        return float(statistics.pstdev(all_vals))
 
     @property
     def drift(self) -> str:
-        """'speeding' | 'dragging' | 'steady'."""
-        if len(self._ibi_window) < 4:
+        """Tempo drift indicator based on linear trend of recent inter-hit intervals.
+
+        Returns
+        -------
+        str
+            ``"rushing"`` if the player is speeding up,
+            ``"dragging"`` if slowing down, or
+            ``"steady"`` if within ±5 % of the mean interval.
+        """
+        ihi = list(self._recent_ihi_ms)
+        if len(ihi) < 4:
             return "steady"
-        first_half = list(self._ibi_window)[: len(self._ibi_window) // 2]
-        second_half = list(self._ibi_window)[len(self._ibi_window) // 2:]
-        d = statistics.mean(second_half) - statistics.mean(first_half)
-        if d > 1.5:
-            return "speeding"
-        if d < -1.5:
+
+        # Simple linear regression slope (ms/hit)
+        n = len(ihi)
+        xs = list(range(n))
+        mean_x = (n - 1) / 2.0
+        mean_y = statistics.mean(ihi)
+        num = sum((xs[i] - mean_x) * (ihi[i] - mean_y) for i in range(n))
+        den = sum((xs[i] - mean_x) ** 2 for i in range(n))
+        slope = num / den if den != 0 else 0.0
+
+        # Positive slope → intervals growing → player dragging
+        # Negative slope → intervals shrinking → player rushing
+        threshold = mean_y * 0.05  # 5 % of mean interval
+        if slope > threshold:
             return "dragging"
+        if slope < -threshold:
+            return "rushing"
         return "steady"
 
-    def tick_bar(self) -> None:
-        """Advance the per-bar accumulator. Call on each downbeat."""
-        self._bpm_per_bar.append([])
+    # ------------------------------------------------------------------
+    # Post-session — heatmap
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Post-session - heatmap + histogram
-    # ------------------------------------------------------------------
-    def export_heatmaps(self, output_dir: str | Path) -> List[Path]:
+    def hit_heatmap(
+        self,
+        events: List[HitEvent],
+        output_dir: "str | Path",
+    ) -> List[Path]:
+        """Generate a 2-D scatter heatmap per drum line and save as PNG files.
+
+        Because :class:`~airdrums.recording.session.HitEvent` does not store
+        the raw tip position, the drum's ``x_center`` from the kit layout is
+        used as the approximate horizontal position.  A small random jitter is
+        applied so that the density plot is readable.  The y axis represents
+        velocity (0–127).
+
+        Parameters
+        ----------
+        events:
+            Full list of :class:`~airdrums.recording.session.HitEvent` from
+            :meth:`~airdrums.recording.session.Session.get_active_events`.
+        output_dir:
+            Directory where PNGs will be written.
+
+        Returns
+        -------
+        list[Path]
+            Paths to the generated PNG files.
+        """
+        import random
+
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import numpy as np
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        paths: List[Path] = []
 
-        for drum, pts in self._strike_positions.items():
-            if not pts:
-                continue
-            xs = np.array([p[0] for p in pts])
-            ys = np.array([p[1] for p in pts])
+        # Group events by drum name
+        per_drum: Dict[str, List[HitEvent]] = defaultdict(list)
+        for ev in events:
+            per_drum[ev.drum_name].append(ev)
+
+        paths: List[Path] = []
+        rng = random.Random(0)
+
+        for drum_name, drum_events in per_drum.items():
+            x_center = self._x_center_map.get(drum_name, 0.5)
+            xs = [x_center + rng.uniform(-0.04, 0.04) for _ in drum_events]
+            ys = [ev.velocity for ev in drum_events]
+
+            label = next(
+                (dl.label for dl in self.drum_lines if dl.name == drum_name),
+                drum_name,
+            )
             fig, ax = plt.subplots(figsize=(4, 4))
-            ax.hist2d(xs, ys, bins=24, range=[[0, 1], [0, 1]], cmap="inferno")
-            ax.invert_yaxis()
-            ax.set_title(f"Hit heatmap — {drum}")
-            ax.set_xlabel("x")
-            ax.set_ylabel("y")
-            fn = output_dir / f"heatmap_{drum.replace(' ', '_').lower()}.png"
+            ax.scatter(xs, ys, alpha=0.5, s=20, c="#ff7a00")
+            ax.set_xlim(0.0, 1.0)
+            ax.set_ylim(0, 127)
+            ax.set_title(f"Hit scatter — {label}")
+            ax.set_xlabel("x position (approx.)")
+            ax.set_ylabel("velocity (MIDI)")
+
+            fn = output_dir / f"heatmap_{drum_name.replace(' ', '_').lower()}.png"
             fig.tight_layout()
             fig.savefig(fn, dpi=120)
             plt.close(fig)
             paths.append(fn)
-        log.info("Wrote %d heatmap PNGs to %s", len(paths), output_dir)
+
+        log.info("Wrote %d heatmap PNGs to %s.", len(paths), output_dir)
         return paths
 
-    def export_velocity_histograms(self, output_dir: str | Path) -> List[Path]:
+    # ------------------------------------------------------------------
+    # Post-session — velocity histogram per velocity_band
+    # ------------------------------------------------------------------
+
+    def velocity_histogram(
+        self,
+        events: List[HitEvent],
+        output_dir: "str | Path",
+    ) -> List[Path]:
+        """Generate a velocity-band bar chart per drum and save as PNG files.
+
+        Bars represent hit counts per velocity band name
+        (``"ghost"``, ``"soft"``, ``"medium"``, ``"hard"``, ``"accent"``).
+
+        Parameters
+        ----------
+        events:
+            Full hit-event list.
+        output_dir:
+            Directory where PNGs will be written.
+
+        Returns
+        -------
+        list[Path]
+            Paths to the generated PNG files.
+        """
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import numpy as np
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        per_drum: Dict[str, List[int]] = defaultdict(list)
-        for ev in self.session.events:
-            per_drum[ev.drum_name].append(ev.velocity)
+
+        band_order = ["ghost", "soft", "medium", "hard", "accent"]
+
+        per_drum: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: {b: 0 for b in band_order}
+        )
+        for ev in events:
+            per_drum[ev.drum_name][ev.velocity_band] = (
+                per_drum[ev.drum_name].get(ev.velocity_band, 0) + 1
+            )
 
         paths: List[Path] = []
-        for drum, vels in per_drum.items():
-            if not vels:
-                continue
-            fig, ax = plt.subplots(figsize=(4, 3))
-            ax.hist(vels, bins=16, range=(0, 127), color="#ff7a00", edgecolor="black")
-            ax.set_xlim(0, 127)
-            ax.set_title(f"Velocity distribution — {drum}")
-            ax.set_xlabel("MIDI velocity")
+        for drum_name, band_counts in per_drum.items():
+            counts = [band_counts.get(b, 0) for b in band_order]
+            label = next(
+                (dl.label for dl in self.drum_lines if dl.name == drum_name),
+                drum_name,
+            )
+            fig, ax = plt.subplots(figsize=(5, 3))
+            ax.bar(band_order, counts, color="#4a90d9", edgecolor="black")
+            ax.set_title(f"Velocity bands — {label}")
+            ax.set_xlabel("velocity band")
             ax.set_ylabel("hits")
-            fn = output_dir / f"velocity_{drum.replace(' ', '_').lower()}.png"
+
+            fn = output_dir / f"velocity_{drum_name.replace(' ', '_').lower()}.png"
             fig.tight_layout()
             fig.savefig(fn, dpi=120)
             plt.close(fig)
             paths.append(fn)
-        log.info("Wrote %d velocity histograms to %s", len(paths), output_dir)
+
+        log.info(
+            "Wrote %d velocity-band histograms to %s.", len(paths), output_dir
+        )
         return paths
 
     # ------------------------------------------------------------------
-    # Post-session - timing
+    # Post-session — timing accuracy
     # ------------------------------------------------------------------
-    def timing_report(self, bpm: Optional[float] = None, grid: str = "1/16"
-                      ) -> Dict[str, Dict[str, float]]:
-        bpm = bpm or self.bpm
+
+    def timing_accuracy(
+        self,
+        events: List[HitEvent],
+        bpm: Optional[float] = None,
+        grid: str = config.DEFAULT_QUANTIZATION,
+    ) -> Dict[str, Dict[str, float]]:
+        """Compute per-drum timing offset from the nearest BPM grid position.
+
+        Parameters
+        ----------
+        events:
+            Full hit-event list.
+        bpm:
+            Tempo to use for grid calculation.  Falls back to
+            :attr:`self.bpm` if not provided.
+        grid:
+            Quantization grid string, e.g. ``"1/16"``.
+
+        Returns
+        -------
+        dict
+            Mapping of drum name -> stats dict with keys
+            ``mean_offset_ms``, ``abs_mean_offset_ms``, ``stdev_ms``,
+            and ``tendency`` (``"rushing"`` | ``"dragging"`` | ``"locked"``).
+        """
+        effective_bpm = bpm if bpm is not None else self.bpm
         denom = {"1/8": 2, "1/16": 4, "1/32": 8}.get(grid, 4)
-        step_ms = (60000.0 / bpm) / denom
+        step_ms = (60000.0 / effective_bpm) / denom
+
         per_drum: Dict[str, List[float]] = defaultdict(list)
-        for ev in self.session.events:
+        for ev in events:
             offset = ev.timestamp_ms - round(ev.timestamp_ms / step_ms) * step_ms
             per_drum[ev.drum_name].append(offset)
 
         report: Dict[str, Dict[str, float]] = {}
-        for drum, offs in per_drum.items():
-            if not offs:
+        for drum, offsets in per_drum.items():
+            if not offsets:
                 continue
+            mean_off = statistics.mean(offsets)
+            abs_mean = statistics.mean(abs(o) for o in offsets)
+            stdev = statistics.pstdev(offsets) if len(offsets) > 1 else 0.0
+            tendency = (
+                "rushing" if mean_off < -5
+                else "dragging" if mean_off > 5
+                else "locked"
+            )
             report[drum] = {
-                "mean_offset_ms": float(statistics.mean(offs)),
-                "abs_mean_offset_ms": float(statistics.mean(abs(o) for o in offs)),
-                "stdev_ms": float(statistics.pstdev(offs)) if len(offs) > 1 else 0.0,
-                "tendency": ("rushing" if statistics.mean(offs) < -5
-                             else "dragging" if statistics.mean(offs) > 5
-                             else "locked"),
+                "mean_offset_ms": round(mean_off, 3),
+                "abs_mean_offset_ms": round(abs_mean, 3),
+                "stdev_ms": round(stdev, 3),
+                "tendency": tendency,
             }
         return report
 
     # ------------------------------------------------------------------
-    # Post-session - hand balance
+    # Post-session — hand balance
     # ------------------------------------------------------------------
-    def hand_balance(self) -> Dict[str, float]:
-        left, right = [], []
-        for ev in self.session.events:
+
+    def hand_balance(self, events: List[HitEvent]) -> Dict[str, object]:
+        """Compute left/right hit count and per-hand average velocity.
+
+        Parameters
+        ----------
+        events:
+            Full hit-event list.
+
+        Returns
+        -------
+        dict
+            Keys: ``left_count``, ``right_count``, ``left_avg_velocity``,
+            ``right_avg_velocity``.
+        """
+        left_vels: List[int] = []
+        right_vels: List[int] = []
+        for ev in events:
             if ev.hand_side == "left":
-                left.append(ev.velocity)
+                left_vels.append(ev.velocity)
             elif ev.hand_side == "right":
-                right.append(ev.velocity)
-        total = len(left) + len(right)
-        if total == 0:
-            return {"left_count": 0, "right_count": 0, "independence": 0.0}
-        # Limb independence = fraction of near-simultaneous L/R hits
-        events = sorted(self.session.events, key=lambda e: e.timestamp_ms)
-        simultaneous = 0
-        for i in range(len(events) - 1):
-            if (events[i].hand_side in ("left", "right") and
-                    events[i + 1].hand_side in ("left", "right") and
-                    events[i].hand_side != events[i + 1].hand_side and
-                    abs(events[i].timestamp_ms - events[i + 1].timestamp_ms) < 40):
-                simultaneous += 1
+                right_vels.append(ev.velocity)
+
         return {
-            "left_count": len(left),
-            "right_count": len(right),
-            "left_avg_velocity": float(statistics.mean(left)) if left else 0.0,
-            "right_avg_velocity": float(statistics.mean(right)) if right else 0.0,
-            "independence": simultaneous / max(1, total),
+            "left_count": len(left_vels),
+            "right_count": len(right_vels),
+            "left_avg_velocity": (
+                round(statistics.mean(left_vels), 2) if left_vels else 0.0
+            ),
+            "right_avg_velocity": (
+                round(statistics.mean(right_vels), 2) if right_vels else 0.0
+            ),
         }
 
     # ------------------------------------------------------------------
-    # Post-session - summary
+    # Post-session — session summary
     # ------------------------------------------------------------------
-    def summary(self) -> Dict[str, object]:
-        events = self.session.events
+
+    def session_summary(self, events: List[HitEvent]) -> Dict[str, object]:
+        """Return a high-level summary of the session.
+
+        Parameters
+        ----------
+        events:
+            Full merged event list (from
+            :meth:`~airdrums.recording.session.Session.get_active_events`).
+
+        Returns
+        -------
+        dict
+            Keys: ``total_hits``, ``duration_s``, ``hits_per_minute``,
+            ``most_used_drum``, ``least_used_drum``.
+        """
         if not events:
-            return {"total_hits": 0, "duration_s": 0, "hits_per_minute": 0.0,
-                    "most_used_drum": None, "least_used_drum": None}
-        duration_s = (events[-1].timestamp_ms - events[0].timestamp_ms) / 1000.0
+            return {
+                "total_hits": 0,
+                "duration_s": 0.0,
+                "hits_per_minute": 0.0,
+                "most_used_drum": None,
+                "least_used_drum": None,
+            }
+
+        duration_s = (
+            (events[-1].timestamp_ms - events[0].timestamp_ms) / 1000.0
+        )
         counts: Dict[str, int] = defaultdict(int)
         for ev in events:
             counts[ev.drum_name] += 1
-        most = max(counts, key=counts.get)
-        least = min(counts, key=counts.get)
+
+        most_used = max(counts, key=lambda k: counts[k])
+        least_used = min(counts, key=lambda k: counts[k])
+        hpm = len(events) / max(duration_s, 1.0) * 60.0
+
         return {
             "total_hits": len(events),
             "duration_s": round(duration_s, 2),
-            "hits_per_minute": round(len(events) / max(duration_s, 1) * 60, 1),
-            "most_used_drum": most,
-            "least_used_drum": least,
-            "bpm": round(self.bpm, 2),
-            "bpm_stability": round(self.bpm_stability, 2),
+            "hits_per_minute": round(hpm, 1),
+            "most_used_drum": most_used,
+            "least_used_drum": least_used,
         }
 
     # ------------------------------------------------------------------
     # PDF report
     # ------------------------------------------------------------------
-    def export_pdf(self, path: str | Path, include_png_dir: Optional[Path] = None
-                   ) -> Path:
+
+    def export_pdf(
+        self,
+        events: List[HitEvent],
+        path: "str | Path",
+        include_png_dir: Optional[Path] = None,
+        bpm: Optional[float] = None,
+    ) -> Path:
+        """Generate a PDF session report using reportlab.
+
+        The report includes the session summary, hand balance, and timing
+        accuracy table.  If *include_png_dir* is provided, all ``.png`` files
+        in that directory are appended as additional pages.
+
+        Parameters
+        ----------
+        events:
+            Full hit-event list.
+        path:
+            Destination PDF file path.
+        include_png_dir:
+            Optional directory of PNG charts to embed.
+        bpm:
+            Override BPM for timing calculations; defaults to :attr:`self.bpm`.
+
+        Returns
+        -------
+        Path
+            The written PDF file.
+        """
         from reportlab.lib.pagesizes import letter  # type: ignore
-        from reportlab.pdfgen import canvas        # type: ignore
-        from reportlab.lib.units import inch       # type: ignore
+        from reportlab.lib.units import inch         # type: ignore
+        from reportlab.pdfgen import canvas          # type: ignore
 
         path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
         c = canvas.Canvas(str(path), pagesize=letter)
         w, h = letter
 
-        c.setFillColorRGB(0.08, 0.08, 0.12)
-        c.rect(0, 0, w, h, fill=True, stroke=False)
+        def _dark_page() -> None:
+            c.setFillColorRGB(0.08, 0.08, 0.12)
+            c.rect(0, 0, w, h, fill=True, stroke=False)
+
+        # --- Page 1: Summary + hand balance + timing ---
+        _dark_page()
         c.setFillColorRGB(1, 0.5, 0.1)
         c.setFont("Helvetica-Bold", 22)
-        c.drawString(0.5 * inch, h - 0.7 * inch, "AirDrums - Session Report")
+        c.drawString(0.5 * inch, h - 0.7 * inch, "AirDrums V2 — Session Report")
 
         c.setFillColorRGB(0.9, 0.9, 0.9)
         c.setFont("Helvetica", 12)
-        y = h - 1.1 * inch
-        for k, v in self.summary().items():
+        y = h - 1.2 * inch
+
+        summary = self.session_summary(events)
+        for k, v in summary.items():
             c.drawString(0.6 * inch, y, f"{k.replace('_', ' ').title()}: {v}")
             y -= 16
 
-        y -= 10
+        y -= 8
+        c.setFillColorRGB(1, 0.5, 0.1)
         c.setFont("Helvetica-Bold", 14)
-        c.drawString(0.5 * inch, y, "Hand balance")
+        c.drawString(0.5 * inch, y, "Hand Balance")
+        y -= 18
+        c.setFillColorRGB(0.9, 0.9, 0.9)
         c.setFont("Helvetica", 11)
-        y -= 16
-        for k, v in self.hand_balance().items():
-            c.drawString(0.6 * inch, y, f"{k}: {v}")
+        for k, v in self.hand_balance(events).items():
+            c.drawString(0.6 * inch, y, f"{k.replace('_', ' ').title()}: {v}")
             y -= 14
 
-        y -= 10
+        y -= 8
+        c.setFillColorRGB(1, 0.5, 0.1)
         c.setFont("Helvetica-Bold", 14)
-        c.drawString(0.5 * inch, y, "Timing accuracy (1/16 grid)")
+        c.drawString(0.5 * inch, y, f"Timing Accuracy ({config.DEFAULT_QUANTIZATION} grid)")
+        y -= 18
+        c.setFillColorRGB(0.9, 0.9, 0.9)
         c.setFont("Helvetica", 11)
-        y -= 16
-        for drum, rep in self.timing_report().items():
-            c.drawString(0.6 * inch, y,
-                         f"{drum}: {rep['tendency']}  "
-                         f"|avg|={rep['abs_mean_offset_ms']:.1f} ms  "
-                         f"stdev={rep['stdev_ms']:.1f} ms")
+        for drum, rep in self.timing_accuracy(events, bpm=bpm).items():
+            label = next(
+                (dl.label for dl in self.drum_lines if dl.name == drum),
+                drum,
+            )
+            line = (
+                f"{label}: {rep['tendency']}  "
+                f"|avg|={rep['abs_mean_offset_ms']:.1f} ms  "
+                f"stdev={rep['stdev_ms']:.1f} ms"
+            )
+            c.drawString(0.6 * inch, y, line)
             y -= 14
             if y < 1.0 * inch:
                 c.showPage()
+                _dark_page()
+                c.setFillColorRGB(0.9, 0.9, 0.9)
+                c.setFont("Helvetica", 11)
                 y = h - 0.7 * inch
 
-        if include_png_dir is not None and include_png_dir.exists():
-            for png in sorted(include_png_dir.glob("*.png")):
-                c.showPage()
-                c.setFillColorRGB(0.08, 0.08, 0.12)
-                c.rect(0, 0, w, h, fill=True, stroke=False)
-                c.setFillColorRGB(0.9, 0.9, 0.9)
-                c.setFont("Helvetica-Bold", 14)
-                c.drawString(0.5 * inch, h - 0.7 * inch, png.stem)
-                try:
-                    c.drawImage(str(png), 0.5 * inch, 1.0 * inch,
-                                width=w - 1.0 * inch, height=h - 2.0 * inch,
-                                preserveAspectRatio=True)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("Failed to embed %s: %s", png, exc)
+        # --- Additional pages: PNG charts ---
+        if include_png_dir is not None:
+            png_dir = Path(include_png_dir)
+            if png_dir.exists():
+                for png in sorted(png_dir.glob("*.png")):
+                    c.showPage()
+                    _dark_page()
+                    c.setFillColorRGB(0.9, 0.9, 0.9)
+                    c.setFont("Helvetica-Bold", 14)
+                    c.drawString(0.5 * inch, h - 0.7 * inch, png.stem)
+                    try:
+                        c.drawImage(
+                            str(png),
+                            0.5 * inch,
+                            1.0 * inch,
+                            width=w - 1.0 * inch,
+                            height=h - 2.0 * inch,
+                            preserveAspectRatio=True,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.debug("Failed to embed %s in PDF.", png, exc_info=True)
 
         c.save()
-        log.info("Wrote PDF report: %s", path)
+        log.info("Wrote PDF report: %s.", path)
         return path

@@ -1,219 +1,157 @@
 """
 airdrums.tracking.detectors
 ===========================
-Strike detection.
+V2 strike detection via horizontal line-crossing.
 
-VelocitySpikeDetector: one per drumstick tip. Looks for the canonical
-accelerate -> peak -> decelerate profile and emits ("strike", midi_velocity).
-
-FootPedalDetector: one per foot. Uses raw heel / toe / ankle landmarks (NOT
-the drumstick tip) plus a hi-hat state machine.
+``LineCrossDetector`` monitors whether a drumstick tip has crossed downward
+through each drum-line's y threshold while within its x bounds, then maps
+tip speed to a MIDI velocity band and applies per-line cooldowns.
 """
 from __future__ import annotations
 
 import logging
-import math
 import time
-from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from .. import config
-from .skeleton import Joint
 
 log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# VelocitySpikeDetector
-# ---------------------------------------------------------------------------
-class VelocitySpikeDetector:
-    """Detects a drum strike from a drumstick tip's velocity profile.
-
-    The detector fires when the tip has been accelerating strongly, crosses
-    `spike_threshold`, reaches a local peak, then decelerates by at least
-    `peak_drop_ratio` of that peak. MIDI velocity is mapped from peak speed.
-    """
-
-    def __init__(self,
-                 spike_threshold: float = config.STRIKE_SPIKE_THRESHOLD,
-                 cooldown_ms: int = config.STRIKE_COOLDOWN_MS,
-                 peak_drop_ratio: float = config.STRIKE_PEAK_DROP_RATIO,
-                 side: str = "right"):
-        self.spike_threshold = float(spike_threshold)
-        self.cooldown_ms = int(cooldown_ms)
-        self.peak_drop_ratio = float(peak_drop_ratio)
-        self.side = side
-        self._history: Deque[Tuple[float, float]] = deque(maxlen=16)   # (t, speed)
-        self._last_strike_ms: float = 0.0
-        self._peak_speed: float = 0.0
-        self._velocity_curve: str = "linear"
-
-    def set_velocity_curve(self, curve: str) -> None:
-        if curve in ("linear", "logarithmic", "exponential"):
-            self._velocity_curve = curve
-
-    def update(self, tip: Joint, elbow: Optional[Joint] = None
-               ) -> Tuple[Optional[str], int, bool]:
-        """Return (event, midi_velocity, is_rimshot).
-
-        ``event`` is ``"strike"`` or ``None``. ``is_rimshot`` is only
-        meaningful when a strike is returned.
-        """
-        now_ms = time.time() * 1000.0
-        speed = float(tip.speed)
-        self._history.append((now_ms, speed))
-
-        if now_ms - self._last_strike_ms < self.cooldown_ms:
-            return None, 0, False
-
-        # Track the running peak speed over the short window
-        if speed > self._peak_speed:
-            self._peak_speed = speed
-
-        # Need at least a threshold-crossing peak before we can fire
-        if self._peak_speed < self.spike_threshold:
-            return None, 0, False
-
-        # Drop detected: fire
-        if speed < self._peak_speed * self.peak_drop_ratio:
-            peak = self._peak_speed
-            self._peak_speed = 0.0
-            self._last_strike_ms = now_ms
-            velocity = self._speed_to_midi(peak)
-            rim = self._is_rimshot(tip, elbow)
-            log.debug("Strike(%s) peak=%.2f vel=%d rim=%s", self.side, peak, velocity, rim)
-            return "strike", velocity, rim
-        return None, 0, False
-
-    def _speed_to_midi(self, speed: float) -> int:
-        # Map speed in [threshold, 4*threshold] to MIDI [40, 127]
-        norm = (speed - self.spike_threshold) / (3 * self.spike_threshold + 1e-6)
-        norm = max(0.0, min(1.0, norm))
-        if self._velocity_curve == "logarithmic":
-            norm = math.log1p(norm * (math.e - 1)) / 1.0
-        elif self._velocity_curve == "exponential":
-            norm = norm * norm
-        vel = int(40 + norm * (127 - 40))
-        return max(1, min(127, vel))
-
-    def _is_rimshot(self, tip: Joint, elbow: Optional[Joint]) -> bool:
-        """Classify rimshot by forearm angle. Low elbow relative to wrist
-        tends to produce rimshots (glancing hits)."""
-        if elbow is None or not elbow.visible:
-            return False
-        # Vertical drop from elbow to wrist (and wrist to tip) approximated
-        # by y component relative to forearm length.
-        dx = tip.x - elbow.x
-        dy = tip.y - elbow.y
-        length = math.hypot(dx, dy) + 1e-6
-        angle_deg = math.degrees(math.atan2(abs(dy), abs(dx)))
-        return angle_deg < (180.0 - config.RIMSHOT_ELBOW_ANGLE_DEG)
-
-
-# ---------------------------------------------------------------------------
-# FootPedalDetector
+# HitResult
 # ---------------------------------------------------------------------------
 @dataclass
-class PedalEvent:
-    """Event emitted by FootPedalDetector.update()."""
-    kind: str            # "strike" | "hihat_state"
-    velocity: int = 0
-    hihat_state: str = "open"
+class HitResult:
+    """Encapsulates a single detected drum hit.
 
-
-class FootPedalDetector:
-    """Heel+toe pedal detector. Uses raw landmark joints, not drumsticks.
-
-    * Right foot -> kick drum: fires on downward heel velocity spike.
-    * Left foot  -> hi-hat pedal: drives a state machine and fires the
-      hi-hat chick on ``closed`` transitions.
+    Attributes:
+        drum_line: The :class:`config.DrumLine` that was crossed.
+        velocity:  MIDI velocity in [1, 127].
+        band_idx:  Index into ``config.VELOCITY_BANDS`` (0 = ghost … 4 = accent).
+        hand_id:   ``"left"`` or ``"right"``.
     """
 
-    def __init__(self, foot: str = "right"):
-        assert foot in ("left", "right")
-        self.foot = foot
-        self.cooldown_ms = (config.PEDAL_KICK_COOLDOWN_MS if foot == "right"
-                            else config.PEDAL_HIHAT_COOLDOWN_MS)
-        self.heel_threshold = config.PEDAL_HEEL_THRESHOLD
-        self._last_strike_ms: float = 0.0
-        self._peak_speed: float = 0.0
-        self._hihat_state: str = "open"
-        self._last_state: str = "open"
+    drum_line: config.DrumLine
+    velocity: int
+    band_idx: int
+    hand_id: str
 
-    @property
-    def hihat_state(self) -> str:
-        return self._hihat_state
 
-    def set_threshold(self, v: float) -> None:
-        self.heel_threshold = float(v)
+# ---------------------------------------------------------------------------
+# LineCrossDetector
+# ---------------------------------------------------------------------------
+class LineCrossDetector:
+    """Detects downward crossings of drum-line thresholds by a stick tip.
 
-    def update(self, heel: Optional[Joint], toe: Optional[Joint],
-               ankle: Optional[Joint]) -> Optional[PedalEvent]:
-        now_ms = time.time() * 1000.0
-        if heel is None or not heel.visible:
-            return None
+    One instance is created per hand.  Both hands operate independently with
+    no shared state; the caller is responsible for handling results from both.
 
-        # Downward velocity in normalized units / s. A pedal stomp spikes vy
-        # positive (image y grows downward).
-        down_speed = max(0.0, heel.vy)
+    The detection algorithm for each drum line per frame:
 
-        event: Optional[PedalEvent] = None
+    1. Confirm tip_x is within the line's x band.
+    2. Confirm tip_vy > 0 (downward motion — upstrokes never trigger).
+    3. Confirm tip_y crossed from above (prev_y < y_position) to at-or-below
+       (tip_y >= y_position) since the last frame.
+    4. Classify tip_speed with :func:`config.classify_velocity`.
+    5. Check the per-band cooldown has elapsed since the last hit on this line.
+    6. Emit :class:`HitResult` and update internal state.
+    """
 
-        if self.foot == "right":
-            # Kick drum: straight velocity-spike detection on heel
-            if down_speed > self._peak_speed:
-                self._peak_speed = down_speed
-            if (self._peak_speed > self.heel_threshold and
-                    down_speed < self._peak_speed * 0.5 and
-                    now_ms - self._last_strike_ms > self.cooldown_ms):
-                velocity = self._speed_to_midi(self._peak_speed)
-                self._peak_speed = 0.0
-                self._last_strike_ms = now_ms
-                event = PedalEvent(kind="strike", velocity=velocity)
-        else:
-            # Hi-hat pedal: state machine driven by heel-toe ratio.
-            ratio = self._heel_toe_ratio(heel, toe, ankle)
-            new_state = self._advance_state(ratio)
-            if new_state != self._last_state:
-                self._last_state = new_state
-                event = PedalEvent(kind="hihat_state", hihat_state=new_state)
-                if new_state == "closed" and now_ms - self._last_strike_ms > self.cooldown_ms:
-                    # Pedal chick fires an audio/MIDI event separately
-                    self._last_strike_ms = now_ms
-                    event = PedalEvent(kind="strike",
-                                       velocity=self._speed_to_midi(down_speed),
-                                       hihat_state=new_state)
-            self._hihat_state = new_state
+    def __init__(self, hand_id: str) -> None:
+        """Create a detector for one hand.
 
-        return event
+        Args:
+            hand_id: ``"left"`` or ``"right"``.
+        """
+        if hand_id not in ("left", "right"):
+            raise ValueError(f"hand_id must be 'left' or 'right', got {hand_id!r}")
+        self.hand_id = hand_id
 
-    def _heel_toe_ratio(self, heel: Joint, toe: Optional[Joint],
-                        ankle: Optional[Joint]) -> float:
-        if toe is None or not toe.visible:
-            return 0.5
-        # When toe is below heel (pedal pressed), ratio drops
-        dy = toe.y - heel.y
-        return float(max(0.0, min(1.0, 0.5 - dy * 3.0)))
+        # Per drum-line state: name -> (last_tip_y, last_trigger_time)
+        self._state: Dict[str, Tuple[float, float]] = {}
 
-    def _advance_state(self, ratio: float) -> str:
-        s = self._hihat_state
-        if s in ("open", "opening"):
-            if ratio > config.HIHAT_CLOSE_PEDAL_THRESHOLD:
-                return "closing"
-            return s
-        if s == "closing":
-            if ratio > config.HIHAT_CLOSE_PEDAL_THRESHOLD + 0.05:
-                return "closed"
-            if ratio < config.HIHAT_OPEN_PEDAL_THRESHOLD:
-                return "opening"
-            return s
-        if s == "closed":
-            if ratio < config.HIHAT_CLOSE_PEDAL_THRESHOLD:
-                return "opening"
-            return s
-        return "open"
+        log.debug("LineCrossDetector created (hand=%s)", hand_id)
 
-    def _speed_to_midi(self, speed: float) -> int:
-        norm = max(0.0, min(1.0, speed / (2.0 * self.heel_threshold + 1e-6)))
-        return max(30, min(127, int(50 + norm * 77)))
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+    def check(
+        self,
+        tip_x: float,
+        tip_y: float,
+        tip_vy: float,
+        tip_speed: float,
+        drum_lines: list,  # list[config.DrumLine]
+    ) -> Optional[HitResult]:
+        """Check whether the tip crossed any drum line downward this frame.
+
+        Args:
+            tip_x: Normalised x of the stick tip.
+            tip_y: Normalised y of the stick tip (0 = top, 1 = bottom).
+            tip_vy: Vertical velocity of the tip (positive = moving downward).
+            tip_speed: Scalar tip speed in normalised units per second.
+            drum_lines: List of :class:`config.DrumLine` objects to test.
+
+        Returns:
+            A :class:`HitResult` for the first line crossed this frame, or
+            ``None`` if no crossing occurred.
+        """
+        now = time.monotonic()
+
+        for dl in drum_lines:
+            line_name = dl.name
+
+            # Retrieve previous tip_y for this line (default: tip_y so no
+            # crossing is reported before we have a previous position).
+            prev_y, last_trigger_time = self._state.get(
+                line_name, (tip_y, 0.0)
+            )
+
+            # --- Gate 1: x must be within the line's horizontal band ----------
+            x_lo = dl.x_center - dl.half_width
+            x_hi = dl.x_center + dl.half_width
+            within_x = x_lo <= tip_x <= x_hi
+
+            # --- Gate 2: downward motion only ---------------------------------
+            moving_down = tip_vy > 0.0
+
+            # --- Gate 3: tip crossed from above to at/below the line ----------
+            crossed = (prev_y < dl.y_position) and (tip_y >= dl.y_position)
+
+            if within_x and moving_down and crossed:
+                # --- Gate 4: velocity band ------------------------------------
+                # Normalise speed to [0, 1] by clamping at the highest band max
+                max_speed = config.VELOCITY_BANDS[-1].speed_max
+                norm_speed = min(tip_speed / max_speed, 1.0) if max_speed > 0 else 0.0
+                band_idx = config.classify_velocity(norm_speed)
+                band = config.VELOCITY_BANDS[band_idx]
+
+                # --- Gate 5: per-band cooldown --------------------------------
+                elapsed_s = now - last_trigger_time
+                cooldown_s = band.cooldown_ms / 1000.0
+                if elapsed_s >= cooldown_s:
+                    midi_vel = config.band_to_midi_velocity(band_idx, norm_speed)
+                    midi_vel = max(1, min(127, midi_vel))
+
+                    # Update trigger time; tip_y updated below after the loop
+                    self._state[line_name] = (tip_y, now)
+
+                    log.debug(
+                        "HIT hand=%s line=%s band=%s vel=%d speed=%.3f",
+                        self.hand_id, line_name, band.name, midi_vel, tip_speed,
+                    )
+                    return HitResult(
+                        drum_line=dl,
+                        velocity=midi_vel,
+                        band_idx=band_idx,
+                        hand_id=self.hand_id,
+                    )
+
+            # Always update last_tip_y for the next frame so we can detect
+            # the crossing direction correctly.
+            _, last_trigger_time = self._state.get(line_name, (tip_y, 0.0))
+            self._state[line_name] = (tip_y, last_trigger_time)
+
+        return None

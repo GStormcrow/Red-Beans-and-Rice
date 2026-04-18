@@ -1,14 +1,14 @@
-"""Tracking subsystem: pose, depth, drumstick, strike detection."""
-from .skeleton import Joint, DrumSkeleton
-from .depth import DepthEngine
-from .detectors import VelocitySpikeDetector, FootPedalDetector
-from .drumstick import Drumstick
+"""Tracking subsystem: hand skeleton, depth, drumstick, strike detection."""
+from airdrums.tracking.hands import HandSkeleton, Joint
+from airdrums.tracking.drumstick import Drumstick
+from airdrums.tracking.detectors import LineCrossDetector, HitResult
+from airdrums.tracking.depth import DepthEngine
 
 __all__ = [
+    "HandSkeleton",
     "Joint",
-    "DrumSkeleton",
-    "DepthEngine",
-    "VelocitySpikeDetector",
-    "FootPedalDetector",
     "Drumstick",
+    "LineCrossDetector",
+    "HitResult",
+    "DepthEngine",
 ]

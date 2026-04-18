@@ -1,195 +1,238 @@
-"""
-airdrums.config
-===============
-Central configuration for the AirDrums system. All tunable constants, zone
-coordinates, MIDI mappings, paths, and hardware profile settings live here.
-No logic module should hardcode values that could appear in this file.
-"""
+"""Central configuration for AirDrums V2 — all constants live here, never in logic modules."""
+
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import List, Optional, Tuple
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Paths
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 HOME_DIR = Path.home() / ".airdrums"
 PROFILES_DIR = HOME_DIR / "profiles"
 SESSIONS_DIR = HOME_DIR / "sessions"
 EXPORTS_DIR = HOME_DIR / "exports"
-SAMPLE_PACKS_DIR = Path(os.environ.get("AIRDRUMS_PACKS", Path(__file__).parent / "packs"))
-DEFAULT_PROFILE_PATH = PROFILES_DIR / "default.json"
+RECOVERY_DIR = HOME_DIR / "recovery"
 
-for _d in (HOME_DIR, PROFILES_DIR, SESSIONS_DIR, EXPORTS_DIR):
+for _d in (HOME_DIR, PROFILES_DIR, SESSIONS_DIR, EXPORTS_DIR, RECOVERY_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Logging
-# -----------------------------------------------------------------------------
-LOG_LEVEL = os.environ.get("AIRDRUMS_LOG", "INFO")
-LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
+# ---------------------------------------------------------------------------
+LOG_LEVEL = logging.DEBUG
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Camera
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 CAMERA_INDEX = 0
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 
-# -----------------------------------------------------------------------------
-# Hardware profiles
-# -----------------------------------------------------------------------------
-@dataclass(frozen=True)
+# ---------------------------------------------------------------------------
+# Hardware Profiles
+# ---------------------------------------------------------------------------
+@dataclass
 class HardwareProfile:
-    """Describes a runtime configuration appropriate for a class of hardware."""
+    """Resource limits for a hardware tier."""
+
     name: str
-    depth_model: str          # HuggingFace repo id
-    depth_target_fps: int
-    pose_complexity: int      # 0 | 1 | 2
-    depth_enabled: bool = True
+    depth_model: str   # HuggingFace model id
+    depth_fps: int     # target depth inference FPS
+    device: str        # 'cuda', 'mps', or 'cpu'
+
 
 PROFILE_HIGH = HardwareProfile(
     name="high",
     depth_model="depth-anything/Depth-Anything-V2-Base-hf",
-    depth_target_fps=28,
-    pose_complexity=1,
+    depth_fps=28,
+    device="cuda",
 )
 PROFILE_MEDIUM = HardwareProfile(
     name="medium",
     depth_model="depth-anything/Depth-Anything-V2-Small-hf",
-    depth_target_fps=18,
-    pose_complexity=1,
+    depth_fps=17,
+    device="mps",
 )
 PROFILE_LOW = HardwareProfile(
     name="low",
     depth_model="depth-anything/Depth-Anything-V2-Small-hf",
-    depth_target_fps=6,
-    pose_complexity=0,
+    depth_fps=6,
+    device="cpu",
 )
-PROFILES = {"high": PROFILE_HIGH, "medium": PROFILE_MEDIUM, "low": PROFILE_LOW}
+PROFILES: dict = {p.name: p for p in (PROFILE_HIGH, PROFILE_MEDIUM, PROFILE_LOW)}
 
-# -----------------------------------------------------------------------------
-# Depth engine
-# -----------------------------------------------------------------------------
-DEPTH_INPUT_SIZE: Tuple[int, int] = (518, 392)  # (W, H) native DA-V2 input
+# ---------------------------------------------------------------------------
+# Depth Engine
+# ---------------------------------------------------------------------------
+DEPTH_INPUT_WIDTH = 518
+DEPTH_INPUT_HEIGHT = 392
 DEPTH_QUEUE_SIZE = 2
-DEPTH_DEFAULT_SCALE = 1.0   # recalibrated at startup
-DEPTH_SAMPLE_KERNEL = 5     # 5x5 median sampling around each landmark
+DEPTH_KERNEL_SIZE = 5   # 5x5 median kernel for landmark depth sampling
 
-# -----------------------------------------------------------------------------
-# Tracking
-# -----------------------------------------------------------------------------
-POSE_LANDMARK_COUNT = 33
-VISIBILITY_THRESHOLD = 0.4
-VELOCITY_HISTORY_FRAMES = 8
+# ---------------------------------------------------------------------------
+# MediaPipe Hands
+# ---------------------------------------------------------------------------
+MP_MAX_HANDS = 2
+MP_DETECTION_CONFIDENCE = 0.7
+MP_TRACKING_CONFIDENCE = 0.6
 
-# -----------------------------------------------------------------------------
-# Virtual drumstick
-# -----------------------------------------------------------------------------
-DRUMSTICK_LENGTH_DEFAULT = 0.18     # normalized to frame height
-DRUMSTICK_LENGTH_MIN = 0.10
-DRUMSTICK_LENGTH_MAX = 0.30
-DRUMSTICK_GRIP_PX = 6
-DRUMSTICK_TIP_PX = 2
-DRUMSTICK_TIP_RADIUS_PX = 5
+# Key landmark indices
+LM_WRIST = 0
+LM_INDEX_MCP = 5
+LM_INDEX_DIP = 7
+LM_INDEX_TIP = 8   # INDEX_FINGER_TIP — primary trigger point
+LM_MIDDLE_MCP = 9
 
-# -----------------------------------------------------------------------------
-# Detection
-# -----------------------------------------------------------------------------
-STRIKE_COOLDOWN_MS = 130
-STRIKE_PEAK_DROP_RATIO = 0.5
-STRIKE_SPIKE_THRESHOLD = 0.9      # normalized speed units / s, calibrated
-PEDAL_KICK_COOLDOWN_MS = 120
-PEDAL_HIHAT_COOLDOWN_MS = 100
-PEDAL_HEEL_THRESHOLD = 0.8        # calibrated
-RIMSHOT_ELBOW_ANGLE_DEG = 150.0   # >=150 treated as center, <150 rimshot
+# ---------------------------------------------------------------------------
+# Virtual Drumstick
+# ---------------------------------------------------------------------------
+STICK_LENGTH_DEFAULT = 0.18   # normalized units
+STICK_LENGTH_MIN = 0.10
+STICK_LENGTH_MAX = 0.30
+VELOCITY_DEQUE_FACTOR = 8     # deque_len = int(factor * fps / 30)
 
-# -----------------------------------------------------------------------------
-# MIDI
-# -----------------------------------------------------------------------------
-MIDI_PORT_NAME = "AirDrums"
-MIDI_CHANNEL = 9              # 0-indexed channel 10 (GM drums)
-MIDI_NOTE_OFF_MS = 50
-MIDI_CLOCK_PPQN = 24
-MIDI_DEFAULT_BPM = 120.0
+# ---------------------------------------------------------------------------
+# Velocity Bands
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class VelocityBand:
+    """Maps a speed range to sample-layer suffixes, cooldown, and MIDI velocity range."""
 
-# -----------------------------------------------------------------------------
-# Audio
-# -----------------------------------------------------------------------------
-AUDIO_SAMPLE_RATE = 44100
-AUDIO_BIT_DEPTH = 16
-AUDIO_CHANNELS = 2
-AUDIO_BUFFER_SIZE = 256
-VELOCITY_LAYERS = ("pp", "mp", "mf", "f", "ff")
-
-# -----------------------------------------------------------------------------
-# Drum kit
-# -----------------------------------------------------------------------------
-@dataclass
-class DrumZone:
-    """A rectangular hit zone in normalized player-relative screen space."""
     name: str
-    x_range: Tuple[float, float]
-    y_range: Tuple[float, float]
-    z_range: Tuple[float, float]
+    speed_min: float
+    speed_max: float
+    suffix: str        # primary: _ghost / _soft / _medium / _hard / _accent
+    alt_suffix: str    # legacy:  _pp / _mp / _mf / _f / _ff
+    cooldown_ms: int
+    midi_lo: int
+    midi_hi: int
+
+
+VELOCITY_BANDS: List[VelocityBand] = [
+    VelocityBand("ghost",  0.00, 0.25, "_ghost",  "_pp",  60,   1,  31),
+    VelocityBand("soft",   0.25, 0.45, "_soft",   "_mp",  90,  32,  63),
+    VelocityBand("medium", 0.45, 0.65, "_medium", "_mf", 120,  64,  95),
+    VelocityBand("hard",   0.65, 0.85, "_hard",   "_f",  160,  96, 111),
+    VelocityBand("accent", 0.85, 1.00, "_accent", "_ff", 200, 112, 127),
+]
+
+
+def classify_velocity(normalized_speed: float) -> int:
+    """Return band index 0-4 for a normalized tip speed in [0, 1]."""
+    for i, band in enumerate(VELOCITY_BANDS):
+        if normalized_speed <= band.speed_max:
+            return i
+    return len(VELOCITY_BANDS) - 1
+
+
+def band_to_midi_velocity(band_idx: int, normalized_speed: float) -> int:
+    """Map a speed within its band to a MIDI velocity in [1, 127]."""
+    band = VELOCITY_BANDS[band_idx]
+    span = band.speed_max - band.speed_min
+    t = (normalized_speed - band.speed_min) / span if span > 0 else 0.5
+    t = max(0.0, min(1.0, t))
+    return int(band.midi_lo + t * (band.midi_hi - band.midi_lo))
+
+# ---------------------------------------------------------------------------
+# Drum Lines
+# ---------------------------------------------------------------------------
+@dataclass
+class DrumLine:
+    """A flat horizontal trigger line representing one drum surface."""
+
+    name: str
+    x_center: float                  # normalized 0.0-1.0
+    y_position: float                # normalized 0.0-1.0 (0 = top)
+    half_width: float                # half trigger width, normalized
     midi_note: int
     color_bgr: Tuple[int, int, int]
-    is_pedal: bool = False
-    # A group for stem export: kick, snare, hihat, toms, cymbals
-    stem_group: str = "toms"
+    is_cymbal: bool
+    label: str
 
-# All coords are normalized to player frame (0..1) where hip center is (0.5, 0.7)
-# and shoulder width ~ 0.35 of frame width. Runtime rescales with player.
-DRUM_ZONES = [
-    DrumZone("Hi-Hat Closed", (0.12, 0.32), (0.35, 0.50), (0.55, 1.0), 42,
-             (255, 255, 0), False, "hihat"),
-    DrumZone("Snare",         (0.40, 0.60), (0.45, 0.60), (0.55, 1.0), 38,
-             (0, 200, 255),   False, "snare"),
-    DrumZone("Tom 1",         (0.30, 0.48), (0.25, 0.40), (0.55, 1.0), 45,
-             (0, 120, 255),   False, "toms"),
-    DrumZone("Tom 2",         (0.52, 0.70), (0.25, 0.40), (0.55, 1.0), 47,
-             (0, 80,  255),   False, "toms"),
-    DrumZone("Floor Tom",     (0.68, 0.88), (0.45, 0.62), (0.55, 1.0), 41,
-             (0, 40,  200),   False, "toms"),
-    DrumZone("Crash Cymbal",  (0.02, 0.20), (0.10, 0.28), (0.55, 1.0), 49,
-             (255, 220, 100), False, "cymbals"),
-    DrumZone("Ride Cymbal",   (0.80, 0.98), (0.10, 0.28), (0.55, 1.0), 51,
-             (220, 180, 80),  False, "cymbals"),
-    DrumZone("Bass Drum",     (0.40, 0.60), (0.82, 0.98), (0.0, 1.0),  36,
-             (150, 80, 255),  True,  "kick"),
-    DrumZone("Hi-Hat Pedal",  (0.12, 0.30), (0.82, 0.98), (0.0, 1.0),  44,
-             (255, 180, 80),  True,  "hihat"),
+
+DEFAULT_DRUM_LINES: List[DrumLine] = [
+    DrumLine("crash",    x_center=0.12, y_position=0.20, half_width=0.10,
+             midi_note=49, color_bgr=(255, 200, 80),  is_cymbal=True,  label="Crash"),
+    DrumLine("hihat",    x_center=0.28, y_position=0.30, half_width=0.10,
+             midi_note=42, color_bgr=(100, 220, 200), is_cymbal=False, label="Hi-Hat"),
+    DrumLine("snare",    x_center=0.50, y_position=0.47, half_width=0.12,
+             midi_note=38, color_bgr=(60, 140, 255),  is_cymbal=False, label="Snare"),
+    DrumLine("tom1",     x_center=0.36, y_position=0.38, half_width=0.10,
+             midi_note=45, color_bgr=(120, 255, 160), is_cymbal=False, label="Tom 1"),
+    DrumLine("tom2",     x_center=0.64, y_position=0.38, half_width=0.10,
+             midi_note=47, color_bgr=(160, 120, 255), is_cymbal=False, label="Tom 2"),
+    DrumLine("floortom", x_center=0.72, y_position=0.57, half_width=0.10,
+             midi_note=41, color_bgr=(255, 100, 180), is_cymbal=False, label="Floor Tom"),
+    DrumLine("ride",     x_center=0.88, y_position=0.20, half_width=0.10,
+             midi_note=51, color_bgr=(80, 200, 255),  is_cymbal=True,  label="Ride"),
 ]
-DRUM_ZONES_BY_NAME = {z.name: z for z in DRUM_ZONES}
-DRUM_ZONES_BY_NOTE = {z.midi_note: z for z in DRUM_ZONES}
 
-# Rimshot variant for snare
-SNARE_RIMSHOT_NOTE = 37
 
-# -----------------------------------------------------------------------------
-# Hi-hat state machine
-# -----------------------------------------------------------------------------
-HIHAT_STATES = ("open", "closing", "closed", "opening")
-HIHAT_CLOSE_PEDAL_THRESHOLD = 0.65      # heel-toe ratio threshold
-HIHAT_OPEN_PEDAL_THRESHOLD = 0.35
+def get_drum_lines(
+    lines: Optional[List[DrumLine]] = None,
+    mirrored: bool = False,
+) -> List[DrumLine]:
+    """Return drum lines, optionally mirrored for left-handed mode."""
+    src = lines if lines is not None else DEFAULT_DRUM_LINES
+    if not mirrored:
+        return src
+    return [
+        DrumLine(
+            name=dl.name,
+            x_center=1.0 - dl.x_center,
+            y_position=dl.y_position,
+            half_width=dl.half_width,
+            midi_note=dl.midi_note,
+            color_bgr=dl.color_bgr,
+            is_cymbal=dl.is_cymbal,
+            label=dl.label,
+        )
+        for dl in src
+    ]
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# MIDI
+# ---------------------------------------------------------------------------
+MIDI_PORT_NAME = "AirDrums"
+MIDI_CHANNEL = 9             # 0-indexed -> GM channel 10
+MIDI_NOTE_OFF_DELAY_MS = 50
+MIDI_PPQN = 24
+
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
+AUDIO_SAMPLE_RATE = 44100
+AUDIO_CHANNELS = 2
+AUDIO_BUFFER = 256
+AUDIO_BIT_DEPTH = 16
+PACKS_DIR = Path(__file__).parent.parent / "packs"
+
+# ---------------------------------------------------------------------------
 # Recording
-# -----------------------------------------------------------------------------
-SKELETON_KEYFRAME_FPS = 10
-LOOP_BAR_CHOICES = (1, 2, 4, 8)
+# ---------------------------------------------------------------------------
+AUTOSAVE_INTERVAL_S = 60
+LOOP_BAR_OPTIONS = (1, 2, 4, 8)
+PLAYBACK_SPEED_MIN = 0.5
+PLAYBACK_SPEED_MAX = 2.0
+KEYFRAME_FPS = 10
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Analytics
-# -----------------------------------------------------------------------------
-BPM_ROLLING_WINDOW = 8
-QUANTIZE_GRIDS = ("none", "1/8", "1/16", "1/32")
+# ---------------------------------------------------------------------------
+BPM_SMOOTHING_WINDOW = 8    # rolling median over N snare hits
+BPM_STABILITY_BARS = 4      # std-dev window in bars
+DEFAULT_QUANTIZATION = "1/16"
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # UI
-# -----------------------------------------------------------------------------
-HUD_THEMES = ("dark", "light", "neon")
-DEFAULT_HUD_THEME = "dark"
+# ---------------------------------------------------------------------------
+OVERLAY_OPACITY_REST = 0.55
+OVERLAY_OPACITY_NEAR = 1.0
+NEAR_THRESHOLD = 0.05        # normalized vertical distance to line for full opacity
+FLASH_DURATION_MS = 200      # base flash duration in ms; scaled per band
+CONTROLS_AUTO_HIDE_S = 5     # seconds before controls panel auto-hides on launch
