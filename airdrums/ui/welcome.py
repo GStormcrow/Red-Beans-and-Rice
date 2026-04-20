@@ -268,7 +268,7 @@ def launch_welcome(
     class LoadingScreen(QtWidgets.QWidget):
         def __init__(self, settings: Dict, build_args):
             super().__init__()
-            self.setWindowTitle("AirDrums")
+            self.setWindowTitle("Not Quite My Tempo...")
             self.setFixedSize(620, 480)
             self._settings = settings
             self._build_args = build_args
@@ -349,7 +349,7 @@ def launch_welcome(
     class WelcomeWindow(QtWidgets.QWidget):
         def __init__(self):
             super().__init__()
-            self.setWindowTitle("AirDrums")
+            self.setWindowTitle("Not Quite My Tempo...")
             self.setMinimumSize(560, 420)
             self.resize(620, 480)
             self._settings_data: Dict = dict(initial)
@@ -378,7 +378,7 @@ def launch_welcome(
             root.addWidget(self._logo, 0, QtCore.Qt.AlignHCenter)
             root.addSpacing(24)
 
-            title = QtWidgets.QLabel("AirDrums")
+            title = QtWidgets.QLabel("Not Quite My Tempo...")
             title.setAlignment(QtCore.Qt.AlignHCenter)
             title.setStyleSheet(
                 "font-size: 48px; font-weight: 800; "
